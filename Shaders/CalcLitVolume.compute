@@ -1,0 +1,227 @@
+#pragma kernel Calculate
+#pragma kernel Accumulate
+
+#define POINTLIGHT_MAX 32
+#define SPOTLIGHT_MAX 32
+#define EFFECTLIGHT_MAX 32
+#define FOGSPHERE_MAX 32
+
+#define SURFACE_DISPLACEMENT_HEIGHT 1.75
+
+#define USE_SHADOW_ATLAS 
+//#define USE_PHASE_FUNCTIONS
+
+#include <CGINC/LightBuffer.cginc>
+#include <CGINC/VolumetricFog.cginc> 
+
+float _LightAttenuation;
+float4 _DensityParams; //x: BaseDensity, y: BoostDensity, z: Altitude, w: AltitudeRange
+float4 _DensityNoiseParams; //xyz: Noise Offset, w: Noise Scale
+Texture3D<float4> _DensityNoiseTexture;
+float4 _FogColorAbsorbtion;
+
+RWTexture3D<float4> _FogVolume_Body;
+Texture3D<float4> _FogVolume_Reblend;
+RWTexture3D<float4> _FogVolume_Accumulate;
+
+StructuredBuffer<PointLight> _CB_PointLight ;
+StructuredBuffer<PointLight> _CB_EffectLight;
+StructuredBuffer<SpotLight> _CB_SpotLight; 
+StructuredBuffer<FogSphere> _CB_FogSphere;
+
+SamplerState point_clamp_sampler;
+SamplerState point_repeat_sampler;
+SamplerState trilinear_clamp_sampler;
+SamplerState trilinear_repeat_sampler;
+
+float GetAltitudeDensity(float3 worldPos, float noiseFactor)
+{
+	float base = _DensityParams.x;
+	float boost = _DensityParams.y;
+	float altitude = _DensityParams.z;
+	float altitudeRange = _DensityParams.w;
+	float densityDelta = boost - base;
+
+	float startHeightBoost = altitude + altitudeRange;
+	float endHeightBoost = altitude;
+
+	if (altitudeRange > 0.0) startHeightBoost += SURFACE_DISPLACEMENT_HEIGHT * noiseFactor;
+	if (altitudeRange < 0.0) startHeightBoost -= SURFACE_DISPLACEMENT_HEIGHT * noiseFactor;
+	
+	float heightBoostAmount = invLerp(startHeightBoost, endHeightBoost, worldPos.y);
+	return (densityDelta * heightBoostAmount) + base; 
+}
+
+float4 GetFogSpheresLitDensity(float3 worldPos, float baseDensity)
+{
+	float4 litDensity = float4(0.0, 0.0, 0.0, baseDensity);
+	for (uint index = 0; index < FOGSPHERE_MAX; index++)
+	{
+		FogSphere fs = _CB_FogSphere[index];
+		if (fs.invSqrRange <= 0.0)
+			continue;
+
+		float falloffFactor = getFogSphereFalloff(worldPos, fs);
+		
+
+		float3 col = fs.irradiance; 
+		col *= falloffFactor;
+		col *= _LightAttenuation;
+
+		#ifdef USE_PHASE_FUNCTIONS
+			float phaseFactor = PhaseFactor(fs.position, worldPos, _VF_CameraWorldPos);
+			col *= phaseFactor;
+		#endif
+		
+		litDensity.rgb += col;
+
+		float newDensity = litDensity.a + (falloffFactor * falloffFactor * fs.densityModifier);
+		litDensity.a = newDensity;
+	}
+	
+	litDensity.a = saturate(litDensity.a);
+	return litDensity;
+} 
+
+float3 GetPointLightsIrradiance(float3 worldPos)
+{
+	float3 irradiance = float3(0.0, 0.0, 0.0);
+	for (uint index = 0; index < POINTLIGHT_MAX; index++)
+	{
+		PointLight light = _CB_PointLight[index];
+		if (light.invSqrRange <= 0.0)
+			continue;
+		
+		float falloffFactor = getPointLightFalloff(worldPos, light);
+		 
+		float3 col = light.irradiance;
+		col *= falloffFactor;
+		col *= _LightAttenuation;
+		
+		#ifdef USE_PHASE_FUNCTIONS
+			float phaseFactor = PhaseFactor(light.position, worldPos, _VF_CameraWorldPos);
+			col *= phaseFactor;
+		#endif
+		
+		irradiance += col;
+	}
+	return irradiance;  
+}
+
+float3 GetEffectLightsIrradiance(float3 worldPos)
+{
+	float3 irradiance = float3(0.0, 0.0, 0.0);
+	for (uint index = 0; index < EFFECTLIGHT_MAX; index++)
+	{
+		PointLight light = _CB_EffectLight[index];
+		if (light.invSqrRange <= 0.0)
+			continue;
+		
+		float falloffFactor = getPointLightFalloff(worldPos, light);
+
+		float3 col = light.irradiance;
+		col *= falloffFactor; 
+		col *= _LightAttenuation;
+
+		#ifdef USE_PHASE_FUNCTIONS
+			float phaseFactor = PhaseFactor(light.position, worldPos, _VF_CameraWorldPos);
+			col *= phaseFactor;
+		#endif
+
+		irradiance += col;
+	}
+	return irradiance; 
+}
+
+float3 GetSpotLightsIrradiance(float3 worldPos)
+{
+	float3 irradiance = float3(0.0, 0.0, 0.0);
+	for (uint index = 0; index < SPOTLIGHT_MAX; index++)
+	{
+		SpotLight light = _CB_SpotLight[index];
+		if (light.invSqrRange <= 0.0)
+			continue;
+
+		float falloffFactor = getSpotLightFalloff(worldPos, light);
+
+		float3 col = light.irradiance;
+		col *= falloffFactor;
+		col *= _LightAttenuation;
+
+		#ifdef USE_PHASE_FUNCTIONS
+			float phaseFactor = PhaseFactor(light.position, worldPos, _VF_CameraWorldPos);
+			col *= phaseFactor;
+		#endif
+
+		irradiance += col;
+	}
+	return irradiance;
+}
+
+float3 IrradianceInFog(float3 irradiance)
+{
+	float3 absorbed = irradiance - (_FogColorAbsorbtion.rgb * AbsorbtionCoeff);
+	return max(absorbed, float3(0.0, 0.0, 0.0));
+}
+
+[numthreads(8,4,4)]
+void Calculate (uint3 id : SV_DispatchThreadID)
+{
+	uint3 voxelDim = uint3(_VF_VoxelDimension); 
+	if (!all(id < voxelDim)) return;
+
+	float3 screen = ThreadIDToScreen(id);
+	float planeDistance = ScreenZToPlaneDistance(screen.z); 
+	float3 worldPos = ScreenToWorldPosition(screen.xy, planeDistance);
+
+	//Sample Noise
+	float3 noiseUVWOffset = float3(worldPos.x, worldPos.y, worldPos.z);
+	float3 noiseUVW = (noiseUVWOffset * _DensityNoiseParams.w) + _DensityNoiseParams.xyz;
+	float noise = _DensityNoiseTexture.SampleLevel(trilinear_repeat_sampler, noiseUVW, 0).r;
+
+	//Apply Altitude Density
+	float baseDensity = GetAltitudeDensity(worldPos, noise);
+	baseDensity *= 1.0 - (noise * NoiseCoeff);
+
+	float4 scatteringAndDensity = GetFogSpheresLitDensity(worldPos, baseDensity);
+	scatteringAndDensity.rgb += IrradianceInFog(GetPointLightsIrradiance(worldPos));
+	scatteringAndDensity.rgb += IrradianceInFog(GetEffectLightsIrradiance(worldPos));
+	scatteringAndDensity.rgb += IrradianceInFog(GetSpotLightsIrradiance(worldPos));
+	scatteringAndDensity.rgb *= scatteringAndDensity.a;
+
+	//Temporal Reblend
+	if (ReprojectionBlend > 0.0 && HasPreviousFrame > 0.0)
+	{
+		float3 screenWithJitter = ThreadIDToScreenWithJitter(id);
+		float planeDistanceWithJitter = ScreenZToPlaneDistance(screenWithJitter.z); 
+		float3 worldPosWithJitter = ScreenToWorldPosition(screenWithJitter.xy, planeDistanceWithJitter);
+
+		float3 historyScreenPos = multPoint(_VF_Prev_VP, worldPosWithJitter);
+		if (abs(historyScreenPos.x) < 1.0 && abs(historyScreenPos.y) < 1.0)
+		{
+			float4 history = _FogVolume_Reblend[id];
+			scatteringAndDensity = lerp(history, scatteringAndDensity, ReprojectionBlend);
+		}
+	} 
+
+	_FogVolume_Body[id] = scatteringAndDensity;
+}
+
+[numthreads(16,8,1)]
+void Accumulate (uint3 id : SV_DispatchThreadID)
+{
+	uint3 voxelDim = uint3(_VF_VoxelDimension);
+	if (!all(id < voxelDim)) return;
+
+	float3 screen = ThreadIDToScreen(id);
+	float4 accum = float4(0.0, 0.0, 0.0, 1.0);
+	uint3 pos = uint3(id.xy, 0);
+	for (uint z = 0; z < voxelDim.z; z++)
+	{
+		pos.z = z;
+		float4 slice = _FogVolume_Body[pos]; 
+		float tickness = SliceTickness(screen.xy, float(z));
+		accum = ScatterStep(accum.rgb, accum.a, slice, tickness);
+		_FogVolume_Accumulate[pos] = accum;
+	}
+}

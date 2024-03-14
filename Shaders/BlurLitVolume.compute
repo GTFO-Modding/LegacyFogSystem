@@ -1,0 +1,41 @@
+﻿// Each #kernel tells which function to compile; you can have many kernels
+#pragma kernel Passthrough
+#pragma kernel GaussianBlur
+
+// Create a RenderTexture with enableRandomWrite flag and set it
+// with cs.SetTexture
+Texture3D<float4> _Input;
+RWTexture3D<float4> _Output;
+
+float3 _Dimension;
+
+SamplerState trilinear_clamp_sampler;
+
+[numthreads(8,8,1)]
+void Passthrough (uint3 id : SV_DispatchThreadID)
+{
+    uint3 voxelDim = uint3(_Dimension); 
+    if (!all(id < voxelDim)) return;
+
+    float3 uvw = float3(id) / float3(_Dimension);
+    float3 xo = float3(1.0, 0.0, 0.0) / _Dimension.x;
+    float3 yo = float3(0.0, 1.0, 0.0) / _Dimension.y;
+
+    float4 s1 = _Input.SampleLevel(trilinear_clamp_sampler, uvw, 0);
+    float4 s2 = _Input.SampleLevel(trilinear_clamp_sampler, uvw + xo, 0);
+    float4 s3 = _Input.SampleLevel(trilinear_clamp_sampler, uvw + xo + yo, 0);
+    float4 s4 = _Input.SampleLevel(trilinear_clamp_sampler, uvw + xo - yo, 0);
+    float4 s5 = _Input.SampleLevel(trilinear_clamp_sampler, uvw - xo, 0);
+    float4 s6 = _Input.SampleLevel(trilinear_clamp_sampler, uvw - xo + yo, 0);
+    float4 s7 = _Input.SampleLevel(trilinear_clamp_sampler, uvw - xo - yo, 0);
+    float4 s8 = _Input.SampleLevel(trilinear_clamp_sampler, uvw + yo, 0);
+    float4 s9 = _Input.SampleLevel(trilinear_clamp_sampler, uvw - yo, 0);
+
+    _Output[id] = (s1 + s2 + s3 + s4 + s5 + s6 + s7 + s8 + s9) / 9.0;
+}
+
+[numthreads(8,8,1)]
+void GaussianBlur (uint3 id : SV_DispatchThreadID)
+{
+    
+}
